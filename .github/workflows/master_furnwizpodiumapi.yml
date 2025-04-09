@@ -70,6 +70,6 @@ jobs:
           app-name: 'furnwizpodiumapi'
           slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_58283577BAA048B6814AB3DF972435A6 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE}}
           sku: 'flexconsumption'
         
