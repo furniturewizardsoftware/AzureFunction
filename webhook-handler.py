@@ -53,29 +53,44 @@ def get_vm_url_by_org(org_uid):
 @app.route(route="podium-webhook", auth_level=func.AuthLevel.ANONYMOUS)
 def podium_webhook(req: func.HttpRequest) -> func.HttpResponse:
     try:
-        # Raw body + headers
+        # Step 1: Get body and signature
         body = req.get_body()
-        received_sig = req.headers.get("x-podium-signature")
+        if not body:
+            logging.warning("Empty request body")
+            return func.HttpResponse("Empty body", status_code=400)
 
-        # 1. Validate webhook signature
+        received_sig = req.headers.get("x-podium-signature")
+        if not received_sig:
+            logging.warning("Missing x-podium-signature header")
+            return func.HttpResponse("Missing signature", status_code=400)
+
+        # Step 2: Load secret and validate signature
         secret = get_webhook_secret()
         if not is_valid_signature(body, received_sig, secret):
             logging.warning("Invalid signature")
             return func.HttpResponse("Invalid signature", status_code=403)
 
-        # 2. Parse webhook event
-        event = json.loads(body)
+        # Step 3: Parse webhook event
+        try:
+            event = json.loads(body)
+        except json.JSONDecodeError:
+            logging.warning("Invalid JSON body")
+            return func.HttpResponse("Invalid JSON", status_code=400)
+
         event_type = event.get("eventType")
         org_uid = event.get("organizationUid")
+        if not org_uid:
+            logging.warning("Missing organizationUid in event")
+            return func.HttpResponse("Missing organizationUid", status_code=400)
 
         logging.info(f"Received Podium webhook: {event_type} for org: {org_uid}")
 
-        # 3. Route to VM
+        # Step 4: Route to VM
         vm_url = get_vm_url_by_org(org_uid)
         if not vm_url:
             return func.HttpResponse(f"No VM mapping for org {org_uid}", status_code=404)
 
-        # 4. Forward event to VM
+        # Step 5: Forward to VM
         response = requests.post(vm_url, json=event)
         response.raise_for_status()
 
@@ -83,4 +98,4 @@ def podium_webhook(req: func.HttpRequest) -> func.HttpResponse:
 
     except Exception as e:
         logging.error(f"Webhook error: {str(e)}")
-        return func.HttpResponse(f"Webhook processing error", status_code=500)
+        return func.HttpResponse("Webhook processing error", status_code=500)

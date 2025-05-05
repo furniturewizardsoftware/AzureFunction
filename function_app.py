@@ -1,152 +1,140 @@
-import logging
 import os
-import json
-import azure.functions as func
-import requests
 import time
+import json
+import hmac
+import base64
+import hashlib
+import logging
+import requests
+import azure.functions as func
+from azure.data.tables import TableServiceClient
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
 
-# -------------------------------
-# Load environment variables
-# -------------------------------
+# === ENVIRONMENT CONFIG ===
 PODIUM_CLIENT_ID = os.getenv("PODIUM_CLIENT_ID")
 PODIUM_CLIENT_SECRET = os.getenv("PODIUM_CLIENT_SECRET")
+PODIUM_REDIRECT_URI = os.getenv("PODIUM_REDIRECT_URI")
+KEY_VAULT_URL = os.getenv("KEY_VAULT_URL")
+WEBHOOK_SECRET_NAME = os.getenv("WEBHOOK_SECRET_NAME")
 VM_ENDPOINTS = json.loads(os.getenv("VM_ACCESS_ENDPOINTS", "{}"))
 
-# -------------------------------
-# Token cache for efficiency
-# -------------------------------
-cached_token = None
-cached_token_expiry = 0
+TABLE_NAME = "podiumTokens"
+PARTITION_KEY = "tokens"
+ROUTING_TABLE = "vmRoutingTable"
 
-def get_podium_token():
-    global cached_token, cached_token_expiry
-    current_time = time.time()
+# === HELPERS ===
+def _get_table_client(name):
+    conn_str = os.environ["AzureWebJobsStorage"]
+    service = TableServiceClient.from_connection_string(conn_str)
+    return service.get_table_client(name)
 
-    # If token is still valid, reuse it
-    if cached_token and current_time < cached_token_expiry:
-        return cached_token
+def save_token(org_uid, access_token, refresh_token, expires_in):
+    table = _get_table_client(TABLE_NAME)
+    expires_at = int(time.time()) + expires_in - 60
+    entity = {
+        "PartitionKey": PARTITION_KEY,
+        "RowKey": org_uid,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_at": expires_at
+    }
+    table.upsert_entity(entity)
 
-    # Request new token from Podium
+def get_token(org_uid):
+    table = _get_table_client(TABLE_NAME)
+    entity = table.get_entity(partition_key=PARTITION_KEY, row_key=org_uid)
+    current_time = int(time.time())
+    if current_time < entity["expires_at"]:
+        return entity["access_token"]
+
     res = requests.post("https://api.podium.com/oauth/token", json={
         "client_id": PODIUM_CLIENT_ID,
         "client_secret": PODIUM_CLIENT_SECRET,
-        "grant_type": "client_credentials"
+        "grant_type": "refresh_token",
+        "refresh_token": entity["refresh_token"]
     })
-    res.raise_for_status()
     token_data = res.json()
-    cached_token = token_data["access_token"]
-    cached_token_expiry = current_time + token_data.get("expires_in", 3600) - 60  # buffer of 60s
+    save_token(org_uid, token_data["access_token"], token_data["refresh_token"], token_data.get("expires_in", 3600))
+    return token_data["access_token"]
 
-    return cached_token
+# === ROUTES ===
+app = func.FunctionApp()
 
-# -------------------------------
-# API Router: Maps actions to endpoints
-# -------------------------------
-def route_action(action, token, payload):
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
+@app.function_name(name="oauth_authorize")
+@app.route(route="oauth-authorize", auth_level=func.AuthLevel.ANONYMOUS)
+def oauth_authorize(req: func.HttpRequest) -> func.HttpResponse:
+    state = req.params.get("state", "defaultState")
+    url = (
+        f"https://api.podium.com/oauth/authorize?client_id={PODIUM_CLIENT_ID}"
+        f"&redirect_uri={PODIUM_REDIRECT_URI}&response_type=code&scope=read_payments%20write_payments&state={state}"
+    )
+    return func.HttpResponse(status_code=302, headers={"Location": url})
 
-    # 1. INVOICES
-    if action == "create_invoice":
-        return requests.post("https://api.podium.com/v4/invoices", json=payload, headers=headers).json()
+@app.function_name(name="oauth_callback")
+@app.route(route="oauth-callback", auth_level=func.AuthLevel.ANONYMOUS)
+def oauth_callback(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        code = req.params.get("code")
+        state = req.params.get("state", "defaultOrg")
+        if not code:
+            return func.HttpResponse("Missing code", status_code=400)
 
-    elif action == "get_invoice":
-        uid = payload["uid"]
-        location_uid = payload["locationUid"]
-        return requests.get(f"https://api.podium.com/v4/invoices/{uid}?locationUid={location_uid}", headers=headers).json()
+        res = requests.post("https://api.podium.com/oauth/token", json={
+            "client_id": PODIUM_CLIENT_ID,
+            "client_secret": PODIUM_CLIENT_SECRET,
+            "redirect_uri": PODIUM_REDIRECT_URI,
+            "grant_type": "authorization_code",
+            "code": code
+        })
+        token_data = res.json()
+        save_token(state, token_data["access_token"], token_data["refresh_token"], token_data.get("expires_in", 3600))
+        return func.HttpResponse("Authorization successful! You may close this window.")
+    except Exception as e:
+        return func.HttpResponse(f"OAuth callback failed: {str(e)}", status_code=500)
 
-    elif action == "get_all_invoices":
-        base_url = "https://api.podium.com/v4/invoices"
-        params = "&".join([f"{k}={v}" for k, v in payload.items()])
-        return requests.get(f"{base_url}?{params}", headers=headers).json()
-
-    elif action == "cancel_invoice":
-        uid = payload["uid"]
-        body = {
-            "locationUid": payload["locationUid"],
-            "note": payload["note"]
-        }
-        return requests.post(f"https://api.podium.com/v4/invoices/{uid}/cancel", json=body, headers=headers).json()
-
-    elif action == "refund_invoice":
-        uid = payload["uid"]
-        refund_body = {
-            "amount": payload["amount"],
-            "locationUid": payload["locationUid"],
-            "note": payload["note"],
-            "paymentUid": payload["paymentUid"],
-            "reason": payload["reason"]
-        }
-        return requests.post(f"https://api.podium.com/v4/invoices/{uid}/refund", json=refund_body, headers=headers).json()
-
-    # 2. PAYMENTS
-    elif action == "get_payment":
-        uid = payload["uid"]
-        return requests.get(f"https://api.podium.com/v4/payments/{uid}", headers=headers).json()
-
-    # 3. READERS
-    elif action == "get_reader":
-        uid = payload["uid"]
-        return requests.get(f"https://api.podium.com/v4/readers/{uid}", headers=headers).json()
-
-    # 4. REFUNDS
-    elif action == "create_manual_refund":
-        return requests.post("https://api.podium.com/v4/refunds", json=payload, headers=headers).json()
-
-    elif action == "get_refund":
-        uid = payload["uid"]
-        location_uid = payload["locationUid"]
-        return requests.get(f"https://api.podium.com/v4/refunds/{uid}?locationUid={location_uid}", headers=headers).json()
-
-    else:
-        raise Exception(f"Unsupported action: {action}")
-
-# -------------------------------
-# (Optional) Log results to VM endpoint
-# -------------------------------
-def send_to_vm(vm_id, data):
-    if vm_id not in VM_ENDPOINTS:
-        raise Exception(f"No endpoint for VM ID: {vm_id}")
-    res = requests.post(VM_ENDPOINTS[vm_id], json=data)
-    res.raise_for_status()
-    return res.json()
-
-# -------------------------------
-# Azure Function Entry Point
-# -------------------------------
 @app.function_name(name="podium_router")
 @app.route(route="podium-router", auth_level=func.AuthLevel.FUNCTION)
 def podium_router(req: func.HttpRequest) -> func.HttpResponse:
     try:
-        # Parse JSON body
         body = req.get_json()
         vm_id = body.get("vm_id")
         action = body.get("action")
         payload = body.get("payload")
-
         if not vm_id or not action or not payload:
-            return func.HttpResponse("Missing vm_id, action, or payload", status_code=400)
-
-        # Get Podium Access Token
-        token = get_podium_token()
-
-        # Route to appropriate Podium endpoint
-        result = route_action(action, token, payload)
-
-        # Log to VM (optional)
-        try:
-            send_to_vm(vm_id, {
-                "action": action,
-                "payload": payload,
-                "result": result
-            })
-        except Exception as log_err:
-            logging.warning(f"Log to VM failed: {str(log_err)}")
-
-        return func.HttpResponse(json.dumps(result), mimetype="application/json")
-
+            return func.HttpResponse("Missing fields", status_code=400)
+        token = get_token(vm_id)
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        url = f"https://api.podium.com/v4/{action.replace('_', '/')}"
+        post_actions = ["invoices", "refund_invoice", "cancel_invoice"]
+        if action in post_actions:
+            response = requests.post(url, json=payload, headers=headers)
+        else:
+            response = requests.get(url, headers=headers, params=payload)
+        #response = requests.post(url, json=payload, headers=headers) if action.startswith("create") else requests.get(url, headers=headers)
+        return func.HttpResponse(json.dumps(response.json()), mimetype="application/json")
     except Exception as e:
-        logging.error(f"Error: {str(e)}")
         return func.HttpResponse(str(e), status_code=500)
+
+@app.function_name(name="podium_webhook")
+@app.route(route="podium-webhook", auth_level=func.AuthLevel.ANONYMOUS)
+def podium_webhook(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        body = req.get_body()
+        sig = req.headers.get("x-podium-signature")
+        credential = DefaultAzureCredential()
+        secret = SecretClient(vault_url=KEY_VAULT_URL, credential=credential).get_secret(WEBHOOK_SECRET_NAME).value
+        expected_sig = base64.b64encode(hmac.new(secret.encode(), body, hashlib.sha256).digest()).decode()
+        if not hmac.compare_digest(sig, expected_sig):
+            return func.HttpResponse("Invalid signature", status_code=403)
+
+        event = json.loads(body)
+        org_uid = event.get("organizationUid")
+        table = _get_table_client(ROUTING_TABLE)
+        entity = table.get_entity(partition_key="routing", row_key=org_uid)
+        vm_url = entity["vm_url"]
+        res = requests.post(vm_url, json=event)
+        return func.HttpResponse("Event forwarded", status_code=200)
+    except Exception as e:
+        logging.error(str(e))
+        return func.HttpResponse("Webhook error", status_code=500)
